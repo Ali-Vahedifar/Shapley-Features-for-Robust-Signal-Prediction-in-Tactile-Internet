@@ -25,8 +25,7 @@ This repository implements a novel two-stage predictive framework for Tactile In
 - **27% speedup** when SFV is applied to the LeFo method
 
 <p align="center">
-  <img src="[[SFV.drawio.pdf](https://github.com/user-attachments/files/24190734/SFV.drawio.pdf)](https://github.com/Ali-Vahedifar/Gaussian-Process-Shapley-Feature-Value-for-Signal-Prediction/blob/main/SFV.drawio.pdf)" alt="Framework Overview" width="800"/>
-
+  <img src="https://github.com/Ali-Vahedifar/Gaussian-Process-Shapley-Feature-Value-for-Signal-Prediction/blob/main/SFV.drawio.png" alt="Framework Overview" width="800"/>
 </p>
 
 ## 🚀 Features
