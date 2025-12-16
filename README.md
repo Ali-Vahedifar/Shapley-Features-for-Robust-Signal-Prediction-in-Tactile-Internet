@@ -22,10 +22,11 @@ This repository implements a novel two-stage predictive framework for Tactile In
 
 - **95.72% accuracy** on ResNet+GP+SFV (11.1% improvement over LeFo baseline)
 - **72% inference time reduction** compared to GP alone
-- **27% speedup** when SFV applied to LeFo method
+- **27% speedup** when SFV is applied to the LeFo method
 
 <p align="center">
-  <img src="docs/framework_overview.png" alt="Framework Overview" width="800"/>
+  <img src="[SFV.drawio.pdf](https://github.com/user-attachments/files/24190734/SFV.drawio.pdf)" alt="Framework Overview" width="800"/>
+
 </p>
 
 ## 🚀 Features
