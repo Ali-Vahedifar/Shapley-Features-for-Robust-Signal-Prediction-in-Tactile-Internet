@@ -3,7 +3,7 @@
 Official PyTorch implementation of the paper:
 
 **"Shapley Features for Robust Signal Prediction in Tactile Internet"**  
-*Mohammad Ali Vahedifar, Arthur, and Qi Zhang*  
+*Mohammad Ali Vahedifar, and Qi Zhang*  
 ICASSP 2026
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -114,90 +114,6 @@ python train.py \
     --device cuda
 ```
 
-## 📖 Usage Examples
-
-### 1. Train Gaussian Process Oracle
-
-```python
-from gaussian_process import create_gp_oracle
-import numpy as np
-
-# Load your haptic data
-X_history = np.load('data/X_history.npy')  # Shape: (n_samples, n_features)
-Y_history = np.load('data/Y_history.npy')  # Shape: (n_samples, output_dim)
-
-# Create and train GP oracle
-gp = create_gp_oracle(
-    X_history=X_history,
-    Y_history=Y_history,
-    kernel_type='rbf',
-    device='cuda'
-)
-
-# Make predictions with uncertainty
-X_test = np.load('data/X_test.npy')
-mean, std = gp.predict(torch.from_numpy(X_test).float(), return_std=True)
-
-print(f"Predicted mean: {mean}")
-print(f"Prediction uncertainty: {std}")
-```
-
-### 2. Compute Shapley Feature Values
-
-```python
-from shapley_feature_value import select_features_with_shapley
-from models import create_model
-
-# Create a simple model for evaluation
-model = create_model('fc', input_dim=9, output_dim=9)
-
-# Select top 5 features using Shapley values
-selected_features, importance = select_features_with_shapley(
-    model=model,
-    X_train=X_train,
-    Y_train=Y_train,
-    k=5  # Select top 5 features
-)
-
-print(f"Selected features: {selected_features}")
-print(f"Feature importance: {importance}")
-```
-
-### 3. Train Neural Network with JSD Loss
-
-```python
-from models import create_model
-from loss_functions import create_loss_function
-import torch.optim as optim
-
-# Create ResNet model (best performing in paper)
-model = create_model('resnet', input_dim=5, output_dim=9)
-
-# Create JSD loss function
-criterion = create_loss_function('jsd')
-
-# Setup optimizer (SGD with momentum as in paper)
-optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-# Training loop
-for epoch in range(num_epochs):
-    for X_batch, Y_batch in train_loader:
-        # Get GP predictions (ground truth distribution)
-        gp_mean, gp_std = gp.predict(X_batch, return_std=True)
-        
-        # Neural network predictions
-        nn_predictions = model(X_batch[:, selected_features])
-        nn_std = torch.ones_like(nn_predictions) * 0.1
-        
-        # Compute JSD loss
-        loss, jsd, mse = criterion(nn_predictions, nn_std, gp_mean, gp_std)
-        
-        # Backpropagation
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-```
-
 ## 📁 Project Structure
 
 ```
@@ -219,36 +135,6 @@ shapley-gp-ti/
     ├── horizontal_movement_fast.npy
     └── ...
 ```
-
-## 📊 Generating Paper Figures
-
-To reproduce the figures from the paper:
-
-### Figure 2: Prediction Accuracy Heatmap + Computational Cost
-```bash
-python generate_heatmap.py
-```
-Generates `heatmap.pdf` and `heatmap.png` with:
-- (a) Prediction accuracy heatmap for GP+SFV ResNet across all datasets
-- (b) Computational cost comparison (offline vs online operations)
-
-Key values verified:
-- D1 ResNet GP+SFV: Human=96.40%, Robot=95.04% (matches Table 1)
-- GP refitting: 125 ms per 10 samples
-- NN inference: 2.2 ms per sample (matches Table 3)
-
-### Figure 3: Shapley Feature Value Analysis + Accumulated Error
-```bash
-python generate_error_shapley.py
-```
-Generates `ErrorShapley.pdf` and `ErrorShapley.png` with:
-- (a) SFV bar chart showing feature importance (threshold φ_a=0.1)
-- (b) Accumulated error over prediction steps
-
-Key values verified:
-- Force Y: φ_a=0.140 (highest importance)
-- Position Z: φ_a=0.135 (second highest)
-- 6 features selected, 33% dimensionality reduction
 
 ## 🧪 Reproducing Paper Results
 
