@@ -113,91 +113,6 @@ python train.py \
     --n_features 7 \
     --device cuda
 ```
-
-## 📖 Usage Examples
-
-### 1. Train Gaussian Process Oracle
-
-```python
-from gaussian_process import create_gp_oracle
-import numpy as np
-
-# Load your haptic data
-X_history = np.load('data/X_history.npy')  # Shape: (n_samples, n_features)
-Y_history = np.load('data/Y_history.npy')  # Shape: (n_samples, output_dim)
-
-# Create and train GP oracle
-gp = create_gp_oracle(
-    X_history=X_history,
-    Y_history=Y_history,
-    kernel_type='rbf',
-    device='cuda'
-)
-
-# Make predictions with uncertainty
-X_test = np.load('data/X_test.npy')
-mean, std = gp.predict(torch.from_numpy(X_test).float(), return_std=True)
-
-print(f"Predicted mean: {mean}")
-print(f"Prediction uncertainty: {std}")
-```
-
-### 2. Compute Shapley Feature Values
-
-```python
-from shapley_feature_value import select_features_with_shapley
-from models import create_model
-
-# Create a simple model for evaluation
-model = create_model('fc', input_dim=9, output_dim=9)
-
-# Select top 5 features using Shapley values
-selected_features, importance = select_features_with_shapley(
-    model=model,
-    X_train=X_train,
-    Y_train=Y_train,
-    k=5  # Select top 5 features
-)
-
-print(f"Selected features: {selected_features}")
-print(f"Feature importance: {importance}")
-```
-
-### 3. Train Neural Network with JSD Loss
-
-```python
-from models import create_model
-from loss_functions import create_loss_function
-import torch.optim as optim
-
-# Create ResNet model (best performing in paper)
-model = create_model('resnet', input_dim=5, output_dim=9)
-
-# Create JSD loss function
-criterion = create_loss_function('jsd')
-
-# Setup optimizer (SGD with momentum as in paper)
-optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-# Training loop
-for epoch in range(num_epochs):
-    for X_batch, Y_batch in train_loader:
-        # Get GP predictions (ground truth distribution)
-        gp_mean, gp_std = gp.predict(X_batch, return_std=True)
-        
-        # Neural network predictions
-        nn_predictions = model(X_batch[:, selected_features])
-        nn_std = torch.ones_like(nn_predictions) * 0.1
-        
-        # Compute JSD loss
-        loss, jsd, mse = criterion(nn_predictions, nn_std, gp_mean, gp_std)
-        
-        # Backpropagation
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-```
-
 ## 📁 Project Structure
 
 ```
@@ -218,27 +133,6 @@ shapley-gp-ti/
     └── ...
 ```
 
-## 🧪 Reproducing Paper Results
-
-To reproduce the results from Table 2 (Drag Max Stiffness Y Dataset):
-
-### 1. Fully Connected Network
-
-```bash
-python train.py --dataset drag_max_stiffness_y --architecture fc --n_features 5
-```
-
-### 2. LSTM Network
-
-```bash
-python train.py --dataset drag_max_stiffness_y --architecture lstm --n_features 5
-```
-
-### 3. ResNet (Best Results)
-
-```bash
-python train.py --dataset drag_max_stiffness_y --architecture resnet --n_features 5
-```
 
 ## 📈 Results
 
