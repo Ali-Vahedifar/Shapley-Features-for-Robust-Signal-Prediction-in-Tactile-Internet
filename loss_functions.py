@@ -8,6 +8,12 @@ JSD is a symmetric measure of similarity between two probability distributions,
 ensuring that predicted haptic signals statistically match the GP's estimates.
 
 Reference: "Shapley Features for Robust Signal Prediction in Tactile Internet"
+
+From the paper (Section 4.1):
+- JSD(P_GP || Q_NN) = 0.5 * KL(P_GP || M) + 0.5 * KL(Q_NN || M)
+- M = 0.5 * (P_GP + Q_NN) is the mixture distribution
+- Since M is a two-component Gaussian mixture, no closed-form solution exists
+- We therefore employ a Monte Carlo approximation
 """
 
 import torch
@@ -19,13 +25,21 @@ from typing import Tuple
 
 class JSDLoss(nn.Module):
     """
-    Jensen-Shannon Divergence Loss Function.
+    Jensen-Shannon Divergence Loss Function with Monte Carlo Approximation.
     
     The JSD loss measures the statistical similarity between the neural network's
     predicted distribution (Q_NN) and the GP oracle's distribution (P_GP).
     
+    From the paper (Eq. 5):
     JSD(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M)
-    where M = 0.5 * (P + Q) is the average distribution.
+    where M = 0.5 * (P + Q) is the mixture distribution.
+    
+    Since M is a two-component Gaussian mixture rather than a single Gaussian,
+    no closed-form solution exists. We therefore employ Monte Carlo approximation.
+    
+    From the paper (Eq. 7):
+    KL(P_GP || M) ≈ (1/L) * Σ [log p(x^(l)) - log m(x^(l))]
+    where m(x) = 0.5 * p(x) + 0.5 * q(x)
     
     Properties:
     - Symmetric: JSD(P||Q) = JSD(Q||P)
@@ -35,46 +49,129 @@ class JSDLoss(nn.Module):
     
     def __init__(
         self,
+        n_samples: int = 100,
         reduction: str = 'mean',
         epsilon: float = 1e-10
     ):
         """
-        Initialize JSD Loss.
+        Initialize JSD Loss with Monte Carlo approximation.
         
         Args:
+            n_samples: Number of Monte Carlo samples (L in paper)
             reduction: How to reduce batch losses ('mean', 'sum', or 'none')
             epsilon: Small constant for numerical stability
         """
         super(JSDLoss, self).__init__()
         
         # Store configuration
+        self.n_samples = n_samples  # L in paper
         self.reduction = reduction
         self.epsilon = epsilon  # Prevent log(0) errors
     
-    def kl_divergence(
+    def gaussian_log_prob(
         self,
-        P: torch.Tensor,
-        Q: torch.Tensor
+        x: torch.Tensor,
+        mean: torch.Tensor,
+        std: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute Kullback-Leibler divergence between distributions P and Q.
+        Compute log probability density of Gaussian distribution.
         
-        KL(P||Q) = Σ P(i) * log(P(i) / Q(i))
+        log p(x) = -0.5 * [k*log(2π) + log|Σ| + (x-μ)^T Σ^{-1} (x-μ)]
+        
+        For diagonal covariance (independent dimensions):
+        log p(x) = -0.5 * Σ_i [log(2π) + log(σ_i²) + ((x_i - μ_i) / σ_i)²]
         
         Args:
-            P: First probability distribution, shape (batch_size, n_classes)
-            Q: Second probability distribution, shape (batch_size, n_classes)
+            x: Sample points, shape (batch_size, n_samples, output_dim)
+            mean: Distribution mean, shape (batch_size, 1, output_dim)
+            std: Distribution std, shape (batch_size, 1, output_dim)
             
         Returns:
-            KL divergence value(s), shape depends on reduction
+            Log probabilities, shape (batch_size, n_samples)
         """
-        # Add epsilon to prevent log(0) and division by zero
-        P_safe = P + self.epsilon
-        Q_safe = Q + self.epsilon
+        # Ensure numerical stability
+        std = std + self.epsilon
+        var = std ** 2
         
-        # Compute KL divergence: Σ P * log(P/Q)
-        # log(P/Q) = log(P) - log(Q) for numerical stability
-        kl = torch.sum(P_safe * (torch.log(P_safe) - torch.log(Q_safe)), dim=-1)
+        # Compute log probability for each dimension
+        # log p(x_i) = -0.5 * [log(2π) + log(σ²) + ((x - μ)/σ)²]
+        log_prob_per_dim = -0.5 * (
+            np.log(2 * np.pi) + 
+            torch.log(var) + 
+            ((x - mean) ** 2) / var
+        )
+        
+        # Sum over dimensions (assuming independence)
+        # Shape: (batch_size, n_samples)
+        log_prob = torch.sum(log_prob_per_dim, dim=-1)
+        
+        return log_prob
+    
+    def mixture_log_prob(
+        self,
+        x: torch.Tensor,
+        mean_p: torch.Tensor,
+        std_p: torch.Tensor,
+        mean_q: torch.Tensor,
+        std_q: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute log probability of mixture distribution M = 0.5 * P + 0.5 * Q.
+        
+        From paper: m(x) = 0.5 * p(x) + 0.5 * q(x)
+        log m(x) = log(0.5 * p(x) + 0.5 * q(x))
+        
+        Using log-sum-exp trick for numerical stability:
+        log(0.5*p + 0.5*q) = log(0.5) + log(p + q)
+                           = log(0.5) + log_sum_exp([log p, log q])
+        
+        Args:
+            x: Sample points, shape (batch_size, n_samples, output_dim)
+            mean_p, std_p: Parameters of distribution P (GP)
+            mean_q, std_q: Parameters of distribution Q (NN)
+            
+        Returns:
+            Log mixture probabilities, shape (batch_size, n_samples)
+        """
+        # Compute log probabilities for both distributions
+        log_p = self.gaussian_log_prob(x, mean_p, std_p)  # (batch, n_samples)
+        log_q = self.gaussian_log_prob(x, mean_q, std_q)  # (batch, n_samples)
+        
+        # Stack for log-sum-exp: (batch, n_samples, 2)
+        log_probs = torch.stack([log_p, log_q], dim=-1)
+        
+        # log m(x) = log(0.5) + log_sum_exp([log p, log q])
+        # log(0.5) = -log(2)
+        log_mixture = -np.log(2) + torch.logsumexp(log_probs, dim=-1)
+        
+        return log_mixture
+    
+    def monte_carlo_kl(
+        self,
+        samples: torch.Tensor,
+        log_p_samples: torch.Tensor,
+        log_m_samples: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Monte Carlo approximation of KL divergence.
+        
+        From paper (Eq. 7):
+        KL(P || M) ≈ (1/L) * Σ_{l=1}^{L} [log p(x^(l)) - log m(x^(l))]
+        
+        Args:
+            samples: Samples from distribution P, shape (batch_size, n_samples, output_dim)
+            log_p_samples: log p(x) for each sample, shape (batch_size, n_samples)
+            log_m_samples: log m(x) for each sample, shape (batch_size, n_samples)
+            
+        Returns:
+            KL divergence estimate, shape (batch_size,)
+        """
+        # KL(P||M) ≈ (1/L) * Σ [log p(x) - log m(x)]
+        kl = torch.mean(log_p_samples - log_m_samples, dim=-1)
+        
+        # Clamp to avoid negative values due to numerical issues
+        kl = torch.clamp(kl, min=0.0)
         
         return kl
     
@@ -86,76 +183,70 @@ class JSDLoss(nn.Module):
         target_std: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute Jensen-Shannon Divergence between predicted and target distributions.
+        Compute Jensen-Shannon Divergence using Monte Carlo approximation.
         
-        For Gaussian distributions, we use a closed-form approximation based on
-        discretizing the distributions into probability bins.
+        From paper (Eq. 5):
+        JSD(P_GP || Q_NN) = 0.5 * KL(P_GP || M) + 0.5 * KL(Q_NN || M)
+        
+        From paper (Eq. 7), Monte Carlo approximation:
+        KL(P || M) ≈ (1/L) * Σ [log p(x^(l)) - log m(x^(l))]
+        where samples x^(l) are drawn from P
         
         Args:
-            pred_mean: Predicted means from NN, shape (batch_size, output_dim)
-            pred_std: Predicted standard deviations, shape (batch_size, output_dim)
-            target_mean: Target means from GP, shape (batch_size, output_dim)
-            target_std: Target standard deviations, shape (batch_size, output_dim)
+            pred_mean: Predicted means from NN (Q), shape (batch_size, output_dim)
+            pred_std: Predicted standard deviations from NN, shape (batch_size, output_dim)
+            target_mean: Target means from GP (P), shape (batch_size, output_dim)
+            target_std: Target standard deviations from GP, shape (batch_size, output_dim)
             
         Returns:
             JSD loss value (scalar if reduction='mean'/'sum')
         """
-        # Create discretized probability distributions from Gaussian parameters
-        # We sample points around the means and compute probability densities
-        
-        # Define range for discretization (cover ±3 standard deviations)
-        n_bins = 50  # Number of discretization points
-        
-        # Determine range for discretization (union of both distributions' ranges)
-        # Cover ±3 sigma around both means
-        min_val = torch.min(
-            pred_mean - 3 * pred_std,
-            target_mean - 3 * target_std
-        )
-        max_val = torch.max(
-            pred_mean + 3 * pred_std,
-            target_mean + 3 * target_std
-        )
-        
-        # Create discretization points (bins)
-        # Shape: (batch_size, output_dim, n_bins)
-        bins = torch.linspace(0, 1, n_bins, device=pred_mean.device)
-        bins = bins.view(1, 1, -1)  # Reshape for broadcasting
-        bins = min_val.unsqueeze(-1) + bins * (max_val - min_val).unsqueeze(-1)
-        
-        # Compute Gaussian probability density at each bin
-        # For predicted distribution Q_NN
-        pred_probs = self._gaussian_pdf(bins, pred_mean.unsqueeze(-1), pred_std.unsqueeze(-1))
-        
-        # For target distribution P_GP
-        target_probs = self._gaussian_pdf(bins, target_mean.unsqueeze(-1), target_std.unsqueeze(-1))
-        
-        # Normalize to ensure probabilities sum to 1
-        pred_probs = pred_probs / (torch.sum(pred_probs, dim=-1, keepdim=True) + self.epsilon)
-        target_probs = target_probs / (torch.sum(target_probs, dim=-1, keepdim=True) + self.epsilon)
-        
-        # Compute average distribution M = 0.5 * (P + Q)
-        M = 0.5 * (pred_probs + target_probs)
-        
-        # Compute JSD = 0.5 * KL(P||M) + 0.5 * KL(Q||M)
-        # Reshape for KL computation: (batch_size * output_dim, n_bins)
         batch_size, output_dim = pred_mean.shape
-        P_flat = target_probs.reshape(-1, n_bins)
-        Q_flat = pred_probs.reshape(-1, n_bins)
-        M_flat = M.reshape(-1, n_bins)
+        device = pred_mean.device
         
-        # Compute both KL divergences
-        kl_pm = self.kl_divergence(P_flat, M_flat)
-        kl_qm = self.kl_divergence(Q_flat, M_flat)
+        # Reshape means and stds for broadcasting: (batch_size, 1, output_dim)
+        mean_p = target_mean.unsqueeze(1)  # GP distribution (P)
+        std_p = target_std.unsqueeze(1)
+        mean_q = pred_mean.unsqueeze(1)    # NN distribution (Q)
+        std_q = pred_std.unsqueeze(1)
         
-        # Combine KL divergences for JSD
-        jsd = 0.5 * (kl_pm + kl_qm)
+        # ============================================
+        # Step 1: Compute KL(P_GP || M)
+        # Draw L samples from P_GP (target/GP distribution)
+        # ============================================
+        # Sample from N(mean_p, std_p): x = mean + std * z, where z ~ N(0, 1)
+        z_p = torch.randn(batch_size, self.n_samples, output_dim, device=device)
+        samples_p = mean_p + std_p * z_p  # Shape: (batch_size, n_samples, output_dim)
         
-        # Reshape back to (batch_size, output_dim)
-        jsd = jsd.reshape(batch_size, output_dim)
+        # Compute log p(x) for samples from P
+        log_p_at_samples_p = self.gaussian_log_prob(samples_p, mean_p, std_p)
         
-        # Average over output dimensions
-        jsd = torch.mean(jsd, dim=-1)
+        # Compute log m(x) = log(0.5*p(x) + 0.5*q(x)) for samples from P
+        log_m_at_samples_p = self.mixture_log_prob(samples_p, mean_p, std_p, mean_q, std_q)
+        
+        # Monte Carlo estimate: KL(P||M) ≈ (1/L) * Σ [log p(x) - log m(x)]
+        kl_p_m = self.monte_carlo_kl(samples_p, log_p_at_samples_p, log_m_at_samples_p)
+        
+        # ============================================
+        # Step 2: Compute KL(Q_NN || M)
+        # Draw L samples from Q_NN (predicted/NN distribution)
+        # ============================================
+        z_q = torch.randn(batch_size, self.n_samples, output_dim, device=device)
+        samples_q = mean_q + std_q * z_q  # Shape: (batch_size, n_samples, output_dim)
+        
+        # Compute log q(x) for samples from Q
+        log_q_at_samples_q = self.gaussian_log_prob(samples_q, mean_q, std_q)
+        
+        # Compute log m(x) for samples from Q
+        log_m_at_samples_q = self.mixture_log_prob(samples_q, mean_p, std_p, mean_q, std_q)
+        
+        # Monte Carlo estimate: KL(Q||M) ≈ (1/L) * Σ [log q(x) - log m(x)]
+        kl_q_m = self.monte_carlo_kl(samples_q, log_q_at_samples_q, log_m_at_samples_q)
+        
+        # ============================================
+        # Step 3: Compute JSD = 0.5 * KL(P||M) + 0.5 * KL(Q||M)
+        # ============================================
+        jsd = 0.5 * kl_p_m + 0.5 * kl_q_m  # Shape: (batch_size,)
         
         # Apply reduction
         if self.reduction == 'mean':
@@ -164,40 +255,66 @@ class JSDLoss(nn.Module):
             return torch.sum(jsd)
         else:
             return jsd
+
+
+class KLDivergenceGaussian(nn.Module):
+    """
+    Closed-form KL Divergence between two multivariate Gaussians.
     
-    def _gaussian_pdf(
+    From the paper (Eq. 6):
+    KL(N_1 || N_2) = 0.5 * [tr(Σ_2^{-1} Σ_1) + (μ_2 - μ_1)^T Σ_2^{-1} (μ_2 - μ_1) 
+                           - k + ln(|Σ_2| / |Σ_1|)]
+    
+    where k denotes the dimensionality of the signal.
+    
+    Note: This is provided for reference. For JSD with Gaussian mixture M,
+    we use Monte Carlo approximation since M is not Gaussian.
+    """
+    
+    def __init__(self, epsilon: float = 1e-10):
+        super(KLDivergenceGaussian, self).__init__()
+        self.epsilon = epsilon
+    
+    def forward(
         self,
-        x: torch.Tensor,
-        mean: torch.Tensor,
-        std: torch.Tensor
+        mean1: torch.Tensor,
+        std1: torch.Tensor,
+        mean2: torch.Tensor,
+        std2: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute Gaussian probability density function.
+        Compute KL(N_1 || N_2) using closed-form for diagonal covariances.
         
-        PDF(x) = (1 / (σ√(2π))) * exp(-0.5 * ((x - μ) / σ)²)
+        For diagonal covariances, the formula simplifies to:
+        KL = 0.5 * Σ_i [log(σ_2i²/σ_1i²) + (σ_1i²/σ_2i²) + ((μ_1i - μ_2i)²/σ_2i²) - 1]
         
         Args:
-            x: Points to evaluate, shape (..., n_bins)
-            mean: Mean of Gaussian, shape (..., 1)
-            std: Standard deviation, shape (..., 1)
+            mean1, std1: Parameters of N_1 (μ_1, σ_1)
+            mean2, std2: Parameters of N_2 (μ_2, σ_2)
             
         Returns:
-            Probability densities at x, shape (..., n_bins)
+            KL divergence, shape (batch_size,)
         """
-        # Compute standardized distance: (x - μ) / σ
-        z = (x - mean) / (std + self.epsilon)
+        # Ensure numerical stability
+        std1 = std1 + self.epsilon
+        std2 = std2 + self.epsilon
         
-        # Compute Gaussian PDF
-        # Normalization constant: 1 / (σ√(2π))
-        norm_const = 1.0 / (std * np.sqrt(2 * np.pi) + self.epsilon)
+        var1 = std1 ** 2
+        var2 = std2 ** 2
         
-        # Exponential term: exp(-0.5 * z²)
-        exp_term = torch.exp(-0.5 * z ** 2)
+        # KL divergence for diagonal Gaussians (sum over dimensions)
+        # = 0.5 * Σ [log(σ_2²/σ_1²) + σ_1²/σ_2² + (μ_1-μ_2)²/σ_2² - 1]
+        kl_per_dim = 0.5 * (
+            torch.log(var2 / var1) +  # log(|Σ_2|/|Σ_1|) for diagonal
+            var1 / var2 +              # tr(Σ_2^{-1} Σ_1) for diagonal
+            ((mean1 - mean2) ** 2) / var2 -  # Mahalanobis term
+            1                          # -k per dimension
+        )
         
-        # Complete PDF
-        pdf = norm_const * exp_term
+        # Sum over output dimensions
+        kl = torch.sum(kl_per_dim, dim=-1)
         
-        return pdf
+        return kl
 
 
 class CombinedLoss(nn.Module):
@@ -213,6 +330,7 @@ class CombinedLoss(nn.Module):
         self,
         jsd_weight: float = 1.0,
         mse_weight: float = 0.5,
+        n_samples: int = 100,
         reduction: str = 'mean'
     ):
         """
@@ -221,6 +339,7 @@ class CombinedLoss(nn.Module):
         Args:
             jsd_weight: Weight for JSD loss term
             mse_weight: Weight for MSE loss term
+            n_samples: Number of Monte Carlo samples for JSD
             reduction: Reduction method for both losses
         """
         super(CombinedLoss, self).__init__()
@@ -230,7 +349,7 @@ class CombinedLoss(nn.Module):
         self.mse_weight = mse_weight
         
         # Initialize loss functions
-        self.jsd_loss = JSDLoss(reduction=reduction)
+        self.jsd_loss = JSDLoss(n_samples=n_samples, reduction=reduction)
         self.mse_loss = nn.MSELoss(reduction=reduction)
     
     def forward(
@@ -254,7 +373,7 @@ class CombinedLoss(nn.Module):
             jsd_component: JSD loss value (for logging)
             mse_component: MSE loss value (for logging)
         """
-        # Compute JSD loss (distributional similarity)
+        # Compute JSD loss (distributional similarity) using Monte Carlo
         jsd = self.jsd_loss(pred_mean, pred_std, target_mean, target_std)
         
         # Compute MSE loss (point prediction accuracy)
@@ -349,7 +468,7 @@ def create_loss_function(
         Initialized loss function
     """
     if loss_type == 'jsd':
-        # Pure JSD loss (as described in paper)
+        # Pure JSD loss with Monte Carlo approximation (as described in paper)
         return JSDLoss(**kwargs)
         
     elif loss_type == 'combined':
@@ -370,51 +489,78 @@ def create_loss_function(
 
 if __name__ == "__main__":
     """
-    Test the loss functions.
+    Test the loss functions and verify they match the paper's formulation.
     """
-    # Set random seed
+    # Set random seed for reproducibility
     torch.manual_seed(42)
     
     # Create sample data
     batch_size = 32
-    output_dim = 9
+    output_dim = 9  # 9 features as in paper
     
-    # Predicted distribution from neural network
+    # Predicted distribution from neural network (Q_NN)
     pred_mean = torch.randn(batch_size, output_dim)
     pred_std = torch.abs(torch.randn(batch_size, output_dim)) + 0.1
     
-    # Target distribution from GP oracle
+    # Target distribution from GP oracle (P_GP)
     target_mean = torch.randn(batch_size, output_dim)
     target_std = torch.abs(torch.randn(batch_size, output_dim)) + 0.1
     
-    print("Testing Loss Functions")
-    print("=" * 60)
+    print("=" * 70)
+    print("Testing Loss Functions (Paper: Section 4.1)")
+    print("=" * 70)
     
-    # Test JSD Loss
-    print("\n1. Jensen-Shannon Divergence Loss:")
-    jsd_loss = JSDLoss()
+    # Test JSD Loss with Monte Carlo approximation
+    print("\n1. Jensen-Shannon Divergence Loss (Monte Carlo, Eq. 5 & 7):")
+    print("   JSD(P_GP || Q_NN) = 0.5 * KL(P_GP || M) + 0.5 * KL(Q_NN || M)")
+    print("   where M = 0.5 * (P_GP + Q_NN)")
+    print("   KL approximated via Monte Carlo sampling (L=100 samples)")
+    
+    jsd_loss = JSDLoss(n_samples=100)
     jsd_value = jsd_loss(pred_mean, pred_std, target_mean, target_std)
     print(f"   JSD Loss: {jsd_value.item():.6f}")
     
+    # Verify JSD is bounded [0, log(2)]
+    print(f"   Theoretical bounds: [0, {np.log(2):.6f}]")
+    assert 0 <= jsd_value.item() <= np.log(2) + 0.1, "JSD out of bounds!"
+    print("   ✓ JSD value within theoretical bounds")
+    
+    # Test closed-form KL divergence (for reference)
+    print("\n2. Closed-form KL Divergence (Eq. 6, for reference):")
+    print("   KL(N_1 || N_2) = 0.5 * [tr(Σ_2^{-1}Σ_1) + (μ_2-μ_1)^T Σ_2^{-1}(μ_2-μ_1) - k + ln|Σ_2|/|Σ_1|]")
+    
+    kl_closed = KLDivergenceGaussian()
+    kl_value = kl_closed(pred_mean, pred_std, target_mean, target_std)
+    print(f"   KL(Q_NN || P_GP): {kl_value.mean().item():.6f}")
+    
     # Test Combined Loss
-    print("\n2. Combined Loss (JSD + MSE):")
-    combined_loss = CombinedLoss(jsd_weight=1.0, mse_weight=0.5)
+    print("\n3. Combined Loss (JSD + MSE):")
+    combined_loss = CombinedLoss(jsd_weight=1.0, mse_weight=0.5, n_samples=100)
     total, jsd_comp, mse_comp = combined_loss(pred_mean, pred_std, target_mean, target_std)
     print(f"   Total Loss: {total.item():.6f}")
     print(f"   JSD Component: {jsd_comp.item():.6f}")
     print(f"   MSE Component: {mse_comp.item():.6f}")
     
     # Test Gaussian NLL Loss
-    print("\n3. Gaussian Negative Log-Likelihood Loss:")
+    print("\n4. Gaussian Negative Log-Likelihood Loss:")
     nll_loss = GaussianNLLLoss()
     nll_value = nll_loss(pred_mean, pred_std, target_mean)
     print(f"   NLL Loss: {nll_value.item():.6f}")
     
     # Test standard MSE
-    print("\n4. Standard MSE Loss:")
+    print("\n5. Standard MSE Loss (baseline):")
     mse_loss = nn.MSELoss()
     mse_value = mse_loss(pred_mean, target_mean)
     print(f"   MSE Loss: {mse_value.item():.6f}")
     
-    print("\n" + "=" * 60)
+    # Test that JSD = 0 when distributions are identical
+    print("\n6. Verification: JSD should be ~0 when P = Q:")
+    jsd_identical = jsd_loss(pred_mean, pred_std, pred_mean, pred_std)
+    print(f"   JSD(P || P): {jsd_identical.item():.6f}")
+    assert jsd_identical.item() < 0.01, "JSD should be ~0 for identical distributions!"
+    print("   ✓ JSD ≈ 0 for identical distributions")
+    
+    print("\n" + "=" * 70)
     print("All loss functions working correctly!")
+    print("Implementation matches paper's Monte Carlo JSD formulation.")
+    print("=" * 70)
