@@ -5,7 +5,7 @@ This module implements Gaussian Process regression for haptic signal prediction
 in Tactile Internet applications, serving as an oracle for neural network training.
 
 Reference: "Shapley Features for Robust Signal Prediction in Tactile Internet"
-Authors: Mohammad Ali Vahedifar, Arthur, and Qi Zhang
+Authors: Ali Vahedi, and Qi Zhang
 """
 
 import torch
