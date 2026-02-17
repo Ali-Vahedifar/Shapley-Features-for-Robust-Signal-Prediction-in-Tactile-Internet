@@ -16,7 +16,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 setup(
     name="shapley-gp-ti",
     version="1.0.0",
-    author="Mohammad Ali Vahedifar, Arthur, Qi Zhang",
+    author="Ali Vahedi, Qi Zhang",
     author_email="av@ece.au.dk, qz@ece.au.dk",
     description="Shapley Features for Robust Signal Prediction in Tactile Internet",
     long_description=long_description,
